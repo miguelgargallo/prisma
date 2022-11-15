@@ -27,8 +27,10 @@ import { RawValue, Sql } from 'sql-template-tag'
 import { getPrismaClientDMMF } from '../generation/getDMMF'
 import type { InlineDatasources } from '../generation/utils/buildInlineDatasources'
 import { PrismaClientValidationError } from '.'
+import { $extends, Args as Extension } from './core/extensions/$extends'
 import { MetricsClient } from './core/metrics/MetricsClient'
-import { applyModels } from './core/model/applyModels'
+import { applyModelsAndClientExtensions } from './core/model/applyModelsAndClientExtensions'
+import { UserArgs } from './core/model/UserArgs'
 import { createPrismaPromise } from './core/request/createPrismaPromise'
 import type {
   InteractiveTransactionOptions,
@@ -180,6 +182,8 @@ export type InternalRequestParams = {
   unpacker?: Unpacker // TODO what is this
   lock?: PromiseLike<void>
   otelParentCtx?: Context
+  /** Used to "desugar" a user input into an "expanded" one */
+  argsMapper?: (args?: UserArgs) => UserArgs
 } & Omit<QueryMiddlewareParams, 'runInTransaction'>
 
 // only used by the .use() hooks
@@ -282,9 +286,11 @@ export interface GetPrismaClientConfig {
   inlineSchemaHash?: string
 }
 
-const actionOperationMap = {
+export const actionOperationMap = {
   findUnique: 'query',
+  findUniqueOrThrow: 'query',
   findFirst: 'query',
+  findFirstOrThrow: 'query',
   findMany: 'query',
   count: 'query',
   create: 'mutation',
@@ -305,36 +311,10 @@ const actionOperationMap = {
 
 const TX_ID = Symbol.for('prisma.client.transaction.id')
 
-// TODO improve all these types, need a common place to share them between type
-// gen and this. This will be relevant relevant for type gen tech debt refactor
-export interface Client {
-  /** Only via tx proxy */
-  [TX_ID]?: string
-  _baseDmmf: BaseDMMFHelper
-  _dmmf?: DMMFHelper
-  _engine: Engine
-  _fetcher: RequestHandler
-  _connectionPromise?: Promise<any>
-  _disconnectionPromise?: Promise<any>
-  _engineConfig: EngineConfig
-  _clientVersion: string
-  _errorFormat: ErrorFormat
-  _tracingConfig: TracingConfig
-  readonly $metrics: MetricsClient
-  $use<T>(arg0: Namespace | QueryMiddleware<T>, arg1?: QueryMiddleware | EngineMiddleware<T>)
-  $on(eventType: EngineEventType, callback: (event: any) => void)
-  $connect()
-  $disconnect()
-  _runDisconnect()
-  $executeRaw(query: TemplateStringsArray | Sql, ...values: any[])
-  $queryRaw(query: TemplateStringsArray | Sql, ...values: any[])
-  __internal_triggerPanic(fatal: boolean)
-  $transaction(input: any, options?: any)
-  _request(internalParams: InternalRequestParams): Promise<any>
-}
+export type Client = ReturnType<typeof getPrismaClient> extends new () => infer T ? T : never
 
 export function getPrismaClient(config: GetPrismaClientConfig) {
-  class PrismaClient implements Client {
+  class PrismaClient {
     _baseDmmf: BaseDMMFHelper
     _dmmf?: DMMFHelper
     _engine: Engine
@@ -346,24 +326,26 @@ export function getPrismaClient(config: GetPrismaClientConfig) {
     _errorFormat: ErrorFormat
     _clientEngineType: ClientEngineType
     _tracingConfig: TracingConfig
-    private _hooks?: Hooks
-    private _metrics: MetricsClient
-    private _getConfigPromise?: Promise<{
+    _hooks?: Hooks
+    _metrics: MetricsClient
+    _getConfigPromise?: Promise<{
       datasources: DataSource[]
       generators: GeneratorConfig[]
     }>
-    private _middlewares: Middlewares = new Middlewares()
-    private _previewFeatures: string[]
-    private _activeProvider: string
-    private _transactionId = 1
-    private _rejectOnNotFound?: InstanceRejectOnNotFound
-    private _dataProxy: boolean
+    _middlewares: Middlewares = new Middlewares()
+    _previewFeatures: string[]
+    _activeProvider: string
+    _transactionId = 1
+    _rejectOnNotFound?: InstanceRejectOnNotFound
+    _dataProxy: boolean
+    _extensions: Extension[]
 
     constructor(optionsArg?: PrismaClientOptions) {
       if (optionsArg) {
         validatePrismaClientOptions(optionsArg, config.datasourceNames)
       }
 
+      this._extensions = []
       this._previewFeatures = config.generator?.previewFeatures ?? []
       this._rejectOnNotFound = optionsArg?.rejectOnNotFound
       this._clientVersion = config.clientVersion ?? clientVersion
@@ -500,13 +482,13 @@ export function getPrismaClient(config: GetPrismaClientConfig) {
         throw e
       }
 
-      return applyModels(this) // custom constructor return value
+      return applyModelsAndClientExtensions(this) // custom constructor return value
     }
     get [Symbol.toStringTag]() {
       return 'PrismaClient'
     }
 
-    private getEngine(): Engine {
+    getEngine(): Engine {
       if (this._dataProxy === true) {
         return new DataProxyEngine(this._engineConfig)
       } else if (this._clientEngineType === ClientEngineType.Library) {
@@ -599,7 +581,7 @@ export function getPrismaClient(config: GetPrismaClientConfig) {
       }
     }
 
-    private async _getActiveProvider(): Promise<void> {
+    async _getActiveProvider(): Promise<void> {
       try {
         const configResult = await this._engine.getConfig()
         this._activeProvider = configResult.datasources[0].activeProvider
@@ -611,7 +593,7 @@ export function getPrismaClient(config: GetPrismaClientConfig) {
     /**
      * Executes a raw query and always returns a number
      */
-    private $executeRawInternal(
+    $executeRawInternal(
       transaction: PrismaPromiseTransaction | undefined,
       lock: PromiseLike<void> | undefined,
       query: string | TemplateStringsArray | Sql,
@@ -625,7 +607,7 @@ export function getPrismaClient(config: GetPrismaClientConfig) {
         queryString = query
         parameters = {
           values: serializeRawParameters(values || []),
-          __prismaRawParamaters__: true,
+          __prismaRawParameters__: true,
         }
         checkAlter(queryString, values, 'prisma.$executeRawUnsafe(<SQL>, [...values])')
       } else if (isReadonlyArray(query)) {
@@ -638,7 +620,7 @@ export function getPrismaClient(config: GetPrismaClientConfig) {
             queryString = queryInstance.sql
             parameters = {
               values: serializeRawParameters(queryInstance.values),
-              __prismaRawParamaters__: true,
+              __prismaRawParameters__: true,
             }
             break
           }
@@ -651,7 +633,7 @@ export function getPrismaClient(config: GetPrismaClientConfig) {
             checkAlter(queryString, queryInstance.values, 'prisma.$executeRaw`<SQL>`')
             parameters = {
               values: serializeRawParameters(queryInstance.values),
-              __prismaRawParamaters__: true,
+              __prismaRawParameters__: true,
             }
             break
           }
@@ -660,7 +642,7 @@ export function getPrismaClient(config: GetPrismaClientConfig) {
             queryString = mssqlPreparedStatement(query)
             parameters = {
               values: serializeRawParameters(values),
-              __prismaRawParamaters__: true,
+              __prismaRawParameters__: true,
             }
             break
           }
@@ -688,7 +670,7 @@ export function getPrismaClient(config: GetPrismaClientConfig) {
         }
         parameters = {
           values: serializeRawParameters(query.values),
-          __prismaRawParamaters__: true,
+          __prismaRawParameters__: true,
         }
       }
 
@@ -779,7 +761,7 @@ Or read our docs at https://www.prisma.io/docs/concepts/components/prisma-client
     /**
      * Executes a raw query and returns selected data
      */
-    private $queryRawInternal(
+    async $queryRawInternal(
       transaction: PrismaPromiseTransaction | undefined,
       lock: PromiseLike<void> | undefined,
       query: string | TemplateStringsArray | Sql,
@@ -793,7 +775,7 @@ Or read our docs at https://www.prisma.io/docs/concepts/components/prisma-client
         queryString = query
         parameters = {
           values: serializeRawParameters(values || []),
-          __prismaRawParamaters__: true,
+          __prismaRawParameters__: true,
         }
       } else if (isReadonlyArray(query)) {
         // If this was called as prisma.$queryRaw`<SQL>`, try to generate a SQL prepared statement
@@ -806,7 +788,7 @@ Or read our docs at https://www.prisma.io/docs/concepts/components/prisma-client
             queryString = queryInstance.sql
             parameters = {
               values: serializeRawParameters(queryInstance.values),
-              __prismaRawParamaters__: true,
+              __prismaRawParameters__: true,
             }
             break
           }
@@ -818,7 +800,7 @@ Or read our docs at https://www.prisma.io/docs/concepts/components/prisma-client
             queryString = queryInstance.text
             parameters = {
               values: serializeRawParameters(queryInstance.values),
-              __prismaRawParamaters__: true,
+              __prismaRawParameters__: true,
             }
             break
           }
@@ -829,7 +811,7 @@ Or read our docs at https://www.prisma.io/docs/concepts/components/prisma-client
             queryString = mssqlPreparedStatement(queryInstance.strings)
             parameters = {
               values: serializeRawParameters(queryInstance.values),
-              __prismaRawParamaters__: true,
+              __prismaRawParameters__: true,
             }
             break
           }
@@ -858,7 +840,7 @@ Or read our docs at https://www.prisma.io/docs/concepts/components/prisma-client
         }
         parameters = {
           values: serializeRawParameters(query.values),
-          __prismaRawParamaters__: true,
+          __prismaRawParameters__: true,
         }
       }
 
@@ -955,7 +937,7 @@ new PrismaClient({
      * @param requests
      * @param options
      */
-    private _transactionWithArray({
+    _transactionWithArray({
       promises,
       options,
     }: {
@@ -984,7 +966,7 @@ new PrismaClient({
      * @param options
      * @returns
      */
-    private async _transactionWithCallback({
+    async _transactionWithCallback({
       callback,
       options,
     }: {
@@ -997,7 +979,7 @@ new PrismaClient({
       let result: unknown
       try {
         // execute user logic with a proxied the client
-        result = await callback(transactionProxy(this, { id: info.id }))
+        result = await callback(transactionProxy(this, { id: info.id, payload: info.payload }))
 
         // it went well, then we commit the transaction
         await this._engine.transaction('commit', headers, info)
@@ -1120,7 +1102,7 @@ new PrismaClient({
       }
     }
 
-    private async _executeRequest({
+    async _executeRequest({
       args,
       clientMethod,
       jsModelName,
@@ -1129,6 +1111,7 @@ new PrismaClient({
       action,
       model,
       headers,
+      argsMapper,
       transaction,
       lock,
       unpacker,
@@ -1137,6 +1120,9 @@ new PrismaClient({
       if (this._dmmf === undefined) {
         this._dmmf = await this._getDmmf({ clientMethod, callsite })
       }
+
+      // execute argument transformation before execution
+      args = argsMapper ? argsMapper(args) : args
 
       let rootField: string | undefined
       const operation = actionOperationMap[action]
@@ -1231,7 +1217,7 @@ new PrismaClient({
       })
     }
 
-    private _getDmmf = callOnce(async (params: Pick<InternalRequestParams, 'clientMethod' | 'callsite'>) => {
+    _getDmmf = callOnce(async (params: Pick<InternalRequestParams, 'clientMethod' | 'callsite'>) => {
       try {
         const dmmf = await this._engine.getDmmf()
         return new DMMFHelper(getPrismaClientDMMF(dmmf))
@@ -1254,15 +1240,17 @@ new PrismaClient({
      * @param feature preview flag
      * @returns
      */
-    private _hasPreviewFlag(feature: string) {
+    _hasPreviewFlag(feature: string) {
       return !!this._engineConfig.previewFeatures?.includes(feature)
     }
+
+    $extends = $extends
   }
 
-  return PrismaClient as new (optionsArg?: PrismaClientOptions) => Client
+  return PrismaClient
 }
 
-const forbidden = ['$connect', '$disconnect', '$on', '$transaction', '$use']
+const forbidden = ['$connect', '$disconnect', '$on', '$transaction', '$use', '$extends']
 
 /**
  * Proxy that takes over the client promises to pass `txId`

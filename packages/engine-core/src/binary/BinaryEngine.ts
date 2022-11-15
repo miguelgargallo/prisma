@@ -9,7 +9,6 @@ import { spawn } from 'child_process'
 import EventEmitter from 'events'
 import execa from 'execa'
 import fs from 'fs'
-import type { IncomingHttpHeaders } from 'http'
 import net from 'net'
 import pRetry from 'p-retry'
 import path from 'path'
@@ -23,6 +22,7 @@ import type {
   EngineConfig,
   EngineEventType,
   GetConfigResult,
+  InteractiveTransactionOptions,
 } from '../common/Engine'
 import { Engine } from '../common/Engine'
 import { PrismaClientInitializationError } from '../common/errors/PrismaClientInitializationError'
@@ -43,10 +43,11 @@ import type {
 } from '../common/types/QueryEngine'
 import type * as Tx from '../common/types/Transaction'
 import { printGeneratorConfig } from '../common/utils/printGeneratorConfig'
+import { runtimeHeadersToHttpHeaders } from '../common/utils/runtimeHeadersToHttpHeaders'
 import { fixBinaryTargets, plusX } from '../common/utils/util'
 import byline from '../tools/byline'
 import { omit } from '../tools/omit'
-import { createSpan, getTraceParent, runInChildSpan } from '../tracing'
+import { createSpan, runInChildSpan } from '../tracing'
 import { TracingConfig } from '../tracing/getTracingConfig'
 import type { Result } from './Connection'
 import { Connection } from './Connection'
@@ -512,10 +513,8 @@ ${chalk.dim("In case we're mistaken, please report this to us 🙏.")}`)
       PRISMA_DML_PATH: this.datamodelPath,
     }
 
-    if (this.logQueries || this.logLevel === 'info') {
-      if (this.logQueries) {
-        env.LOG_QUERIES = 'true'
-      }
+    if (this.logQueries) {
+      env.LOG_QUERIES = 'true'
     }
 
     if (this.datasources) {
@@ -933,9 +932,15 @@ You very likely have the wrong "binaryTarget" defined in the schema.prisma file.
     return this.lastVersion
   }
 
-  async request<T>(query: string, headers: QueryEngineRequestHeaders = {}, numTry = 1): Promise<QueryEngineResult<T>> {
+  async request<T>(
+    query: string,
+    headers: QueryEngineRequestHeaders = {},
+    _transaction?: InteractiveTransactionOptions<undefined>,
+    numTry = 1,
+  ): Promise<QueryEngineResult<T>> {
     await this.start()
 
+    // TODO: we don't need the transactionId "runtime header" anymore, we can use the txInfo object here
     this.currentRequestPromise = this.connection.post('/', stringifyQuery(query), runtimeHeadersToHttpHeaders(headers))
     this.lastQuery = query
 
@@ -949,7 +954,7 @@ You very likely have the wrong "binaryTarget" defined in the schema.prisma file.
         throw new PrismaClientUnknownRequestError(JSON.stringify(data.errors), this.clientVersion!)
       }
 
-      // Rust engine returns time in microseconds and we want it in miliseconds
+      // Rust engine returns time in microseconds and we want it in milliseconds
       const elapsed = parseInt(headers['x-elapsed']) / 1000
 
       // reset restart count after successful request
@@ -961,15 +966,12 @@ You very likely have the wrong "binaryTarget" defined in the schema.prisma file.
       return { data, elapsed } as any
     } catch (e: any) {
       logger('req - e', e)
-      if (e instanceof PrismaClientKnownRequestError) {
-        throw e
-      }
 
       await this.handleRequestError(e, numTry <= MAX_REQUEST_RETRIES)
       // retry
       if (numTry <= MAX_REQUEST_RETRIES) {
         logger('trying a retry now')
-        return this.request(query, headers, numTry + 1)
+        return this.request(query, headers, _transaction, numTry + 1)
       }
     }
 
@@ -995,7 +997,7 @@ You very likely have the wrong "binaryTarget" defined in the schema.prisma file.
 
     return this.currentRequestPromise
       .then(({ data, headers }) => {
-        // Rust engine returns time in microseconds and we want it in miliseconds
+        // Rust engine returns time in microseconds and we want it in milliseconds
         const elapsed = parseInt(headers['x-elapsed']) / 1000
         const { batchResult, errors } = data
         if (Array.isArray(batchResult)) {
@@ -1032,9 +1034,9 @@ You very likely have the wrong "binaryTarget" defined in the schema.prisma file.
    * @param options to change the default timeouts
    * @param info transaction information for the QE
    */
-  async transaction(action: 'start', headers: Tx.TransactionHeaders, options?: Tx.Options): Promise<Tx.Info>
-  async transaction(action: 'commit', headers: Tx.TransactionHeaders, info: Tx.Info): Promise<undefined>
-  async transaction(action: 'rollback', headers: Tx.TransactionHeaders, info: Tx.Info): Promise<undefined>
+  async transaction(action: 'start', headers: Tx.TransactionHeaders, options?: Tx.Options): Promise<Tx.Info<undefined>>
+  async transaction(action: 'commit', headers: Tx.TransactionHeaders, info: Tx.Info<undefined>): Promise<undefined>
+  async transaction(action: 'rollback', headers: Tx.TransactionHeaders, info: Tx.Info<undefined>): Promise<undefined>
   async transaction(action: any, headers: Tx.TransactionHeaders, arg?: any) {
     await this.start()
 
@@ -1046,7 +1048,11 @@ You very likely have the wrong "binaryTarget" defined in the schema.prisma file.
       })
 
       const result = await Connection.onHttpError(
-        this.connection.post<Tx.Info>('/transaction/start', jsonOptions, runtimeHeadersToHttpHeaders(headers)),
+        this.connection.post<Tx.Info<undefined>>(
+          '/transaction/start',
+          jsonOptions,
+          runtimeHeadersToHttpHeaders(headers),
+        ),
         (result) => this.transactionHttpErrorHandler(result),
       )
 
@@ -1120,6 +1126,10 @@ You very likely have the wrong "binaryTarget" defined in the schema.prisma file.
     // if we are starting, wait for it before we handle any error
     if (this.startPromise) {
       await this.startPromise
+    }
+
+    if (error instanceof PrismaClientKnownRequestError) {
+      throw error
     }
 
     this.throwAsyncErrorIfExists()
@@ -1243,26 +1253,6 @@ function initHooks() {
     hookProcess('SIGTERM', true)
     hooksInitialized = true
   }
-}
-
-/**
- * Takes runtime data headers and turns it into QE HTTP headers
- * @param headers to transform
- * @returns
- */
-function runtimeHeadersToHttpHeaders(headers: QueryEngineRequestHeaders): IncomingHttpHeaders {
-  return Object.keys(headers).reduce((acc, runtimeHeaderKey) => {
-    let httpHeaderKey = runtimeHeaderKey
-
-    if (runtimeHeaderKey === 'transactionId') {
-      httpHeaderKey = 'X-transaction-id'
-    }
-
-    // if header key isn't changed, a copy happens
-    acc[httpHeaderKey] = headers[runtimeHeaderKey]
-
-    return acc
-  }, {} as IncomingHttpHeaders)
 }
 
 function killProcessAndWait(childProcess: ChildProcess): Promise<void> {

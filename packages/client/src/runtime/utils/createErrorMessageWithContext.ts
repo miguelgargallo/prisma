@@ -1,7 +1,7 @@
+import { DMMF } from '@prisma/generator-helper'
 import chalk from 'chalk'
 import indentString from 'indent-string'
 
-import { allClientModelActions } from '../clientActions'
 import { CallSite, LocationInFile } from './CallSite'
 import { SourceFileSlice } from './SourceFileSlice'
 
@@ -110,7 +110,7 @@ function getTemplateParameters(
 }
 
 function findPrismaActionCall(str: string): { code: string; openingBraceIndex: number } | null {
-  const allActions = allClientModelActions.join('|')
+  const allActions = Object.keys(DMMF.ModelAction).join('|')
   const regexp = new RegExp(String.raw`\S+(${allActions})\(`)
   const match = regexp.exec(str)
   if (match) {
@@ -142,8 +142,8 @@ function stringifyErrorMessage(
 
   const introSuffix = location ? ' in' : ':'
   if (isPanic) {
-    lines.push(colors.red(`Oops, an unknown error occured! This is ${colors.bold('on us')}, you did nothing wrong.`))
-    lines.push(colors.red(`It occured in the ${colors.bold(`\`${functionName}\``)} invocation${introSuffix}`))
+    lines.push(colors.red(`Oops, an unknown error occurred! This is ${colors.bold('on us')}, you did nothing wrong.`))
+    lines.push(colors.red(`It occurred in the ${colors.bold(`\`${functionName}\``)} invocation${introSuffix}`))
   } else {
     lines.push(colors.red(`Invalid ${colors.bold(`\`${functionName}\``)} invocation${introSuffix}`))
   }

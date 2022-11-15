@@ -17,8 +17,7 @@ import type { Document } from './query'
 import { Args, unpack } from './query'
 import { CallSite } from './utils/CallSite'
 import { createErrorMessageWithContext } from './utils/createErrorMessageWithContext'
-import type { RejectOnNotFound } from './utils/rejectOnNotFound'
-import { throwIfNotFound } from './utils/rejectOnNotFound'
+import { NotFoundError, RejectOnNotFound, throwIfNotFound } from './utils/rejectOnNotFound'
 
 const debug = Debug('prisma:client:request_handler')
 
@@ -69,7 +68,7 @@ function getRequestInfo(request: Request) {
   }
 
   return {
-    batchTransaction: transaction?.kind === 'batch' ? transaction : undefined,
+    transaction,
     headers,
   }
 }
@@ -92,13 +91,16 @@ export class RequestHandler {
         // TODO: pass the child information to QE for it to issue links to queries
         // const links = requests.map((r) => trace.getSpanContext(r.otelChildCtx!))
 
-        return this.client._engine.requestBatch(queries, info.headers, info.batchTransaction)
+        const batchTransaction = info.transaction?.kind === 'batch' ? info.transaction : undefined
+
+        return this.client._engine.requestBatch(queries, info.headers, batchTransaction)
       },
       singleLoader: (request) => {
         const info = getRequestInfo(request)
         const query = String(request.document)
+        const interactiveTransaction = info.transaction?.kind === 'itx' ? info.transaction : undefined
 
-        return this.client._engine.request(query, info.headers)
+        return this.client._engine.request(query, info.headers, interactiveTransaction)
       },
       batchBy: (request) => {
         if (request.transaction?.id) {
@@ -186,6 +188,11 @@ export class RequestHandler {
 
   handleRequestError({ error, clientMethod, callsite }: HandleErrorParams): never {
     debug(error)
+    // TODO: This is a workaround to keep backwards compatibility with clients
+    // consuming NotFoundError
+    if (error instanceof NotFoundError) {
+      throw error
+    }
 
     let message = error.message
     if (callsite) {
@@ -273,7 +280,7 @@ function batchFindUniqueBy(request: Request) {
   // we generate a string for the fields we have used in the `includes`
   const selectionSet = request.document.children[0].children!.join(',')
 
-  // queries that share this token will be batched and collapsed alltogether
+  // queries that share this token will be batched and collapsed altogether
   return `${request.document.children[0].name}|${args}|${selectionSet}`
   // this way, the query engine will be able to collapse into a single call
   // and that is because all the queries share their `where` and `includes`
